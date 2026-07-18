@@ -1,0 +1,12 @@
+# data, checkpoints, logs — never in git
+runs/
+data/
+*.pt
+*.zip
+*.npz
+*.out
+wandb/
+__pycache__/
+*.pyc
+miniconda3/
+pulled/
