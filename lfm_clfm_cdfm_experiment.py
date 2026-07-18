@@ -17,15 +17,19 @@
 # =============================================================================
 
 # %% [code]
-# Cell 0: get the trained RVQ-VAE (pull; if it fails, attach it as a Kaggle dataset)
+# Cell 0: (Kaggle only) self-pull the trained RVQ-VAE from the source kernel.
+# On the cluster this is skipped — the checkpoint is provided via RVQ_CKPT env var.
 import os, glob, subprocess
-PULL_KERNEL="khadraouimohamedaziz/notebookf50ed59c15"; PULL_DIR="/kaggle/working/pulled"
-os.makedirs(PULL_DIR,exist_ok=True)
-try:
-    _r=subprocess.run(["kaggle","kernels","output",PULL_KERNEL,"-p",PULL_DIR],capture_output=True,text=True,timeout=1800)
-    if _r.returncode!=0: print("pull failed (likely cross-account perms) -> attach the RVQ-VAE as a dataset.")
-except Exception as _e: print("pull skipped:",_e)
-print("visible .pt:", [p for p in glob.glob("/kaggle/input/**/*.pt",recursive=True)+glob.glob(PULL_DIR+"/**/*.pt",recursive=True) if "rvq" in p.lower()][:5])
+if os.path.isdir("/kaggle"):
+    PULL_KERNEL="khadraouimohamedaziz/notebookf50ed59c15"; PULL_DIR="/kaggle/working/pulled"
+    os.makedirs(PULL_DIR,exist_ok=True)
+    try:
+        _r=subprocess.run(["kaggle","kernels","output",PULL_KERNEL,"-p",PULL_DIR],capture_output=True,text=True,timeout=1800)
+        if _r.returncode!=0: print("pull failed (likely cross-account perms) -> attach the RVQ-VAE as a dataset.")
+    except Exception as _e: print("pull skipped:",_e)
+    print("visible .pt:", [p for p in glob.glob("/kaggle/input/**/*.pt",recursive=True)+glob.glob(PULL_DIR+"/**/*.pt",recursive=True) if "rvq" in p.lower()][:5])
+else:
+    print("[not on Kaggle] skipping self-pull cell; RVQ-VAE comes from RVQ_CKPT env var.")
 
 # %% [code]
 # Cell 1: config + imports
@@ -544,10 +548,21 @@ def train_base(tag,is_latent,total,penalty):
 bases={}
 def _train_if(name,is_latent,penalty):
     if VARIANT in (name,"all"): bases[name]=train_base(name,is_latent,STEPS[name],penalty=penalty)
+# Path 1a: reuse a recovered latent-FM checkpoint instead of retraining the latent base.
+# Set LFM_CKPT to the recovered lfm_best.pt; it is copied into the expected latent_best.pt
+# slot so the eval loader picks it up, and latent training is skipped.
+_LFM_CKPT=os.environ.get("LFM_CKPT","")
+if _LFM_CKPT and os.path.exists(_LFM_CKPT) and VARIANT in ("latent","all","eval"):
+    _dst=os.path.join(CK,"latent_best.pt")
+    if not os.path.exists(_dst):
+        import shutil as _sh; _sh.copy(_LFM_CKPT,_dst); print(f"  [1a] reused recovered LFM -> {_dst} (latent training skipped)")
+    _SKIP_LATENT=True
+else:
+    _SKIP_LATENT=False
 if VARIANT=="eval":
     print("VARIANT=eval -> skipping training; will evaluate existing checkpoints.")
 else:
-    _train_if("latent",True,False)
+    if not _SKIP_LATENT: _train_if("latent",True,False)
     _train_if("latent_pen",True,True)
     _train_if("direct",False,False)
     _train_if("direct_pen",False,True)

@@ -16,7 +16,7 @@ set -e
 export WORK=/export/home/kaziz/motion
 export CPY=$WORK/miniconda3/bin/python
 export HML3D_ROOT=/export/home/kaziz/motion/data/humanml3d_extracted/HumanML3D/humanml
-export RVQ_CKPT=$(ls $WORK/**/rvq_vae_best.pt $WORK/data/**/rvq_vae_best.pt 2>/dev/null | head -1)
+export RVQ_CKPT=$(find $WORK -name rvq_vae_best.pt 2>/dev/null | head -1)
 export WORK_DIR=$WORK/runs
 export WANDB_PROJECT=motion-clfm
 export WANDB_ENTITY=kaziz
