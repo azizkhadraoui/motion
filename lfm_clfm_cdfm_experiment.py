@@ -20,6 +20,9 @@
 # Cell 0: (Kaggle only) self-pull the trained RVQ-VAE from the source kernel.
 # On the cluster this is skipped — the checkpoint is provided via RVQ_CKPT env var.
 import os, glob, subprocess
+class M_ABLATION_STOP(Exception):
+    """Raised to stop module load after models are ready, when imported by the ablation runner."""
+    pass
 if os.path.isdir("/kaggle"):
     PULL_KERNEL="khadraouimohamedaziz/notebookf50ed59c15"; PULL_DIR="/kaggle/working/pulled"
     os.makedirs(PULL_DIR,exist_ok=True)
@@ -138,7 +141,7 @@ _CHAINS=[[0,2,5,8,11],[0,1,4,7,10],[0,3,6,9,12,15],[9,14,17,19,21],[9,13,16,18,2
 EDGES=[(c[k],c[k+1]) for c in _CHAINS for k in range(len(c)-1)]
 EI=torch.tensor([e[0] for e in EDGES],device=DEVICE); EJ=torch.tensor([e[1] for e in EDGES],device=DEVICE)
 FOOT_JOINTS=[7,10,8,11]
-print("="*72); print(f"LFM/CLFM/CDFM | latent={RUN_LATENT} direct={RUN_DIRECT} penalty={TRAIN_PENALTY} | 12k steps"); print("="*72)
+print("="*72); print(f"LFM/CLFM/CDFM | VARIANT={VARIANT} | {'SMOKE ' if SMOKE_TEST else ''}{_S} steps/base | W&B={WANDB_PROJECT}"); print("="*72)
 
 # %% [code]
 # Cell 2: FK + CONSTRAINT PROJECTION (the core; validated below) + inverse-RIC
@@ -334,10 +337,25 @@ def encode_all():
         e=min(s+128,len(train_entries)); B=[pad_norm(train_entries[i]["motion"])[0] for i in range(s,e)]
         Z.append(rvq.encoder(torch.tensor(np.stack(B),device=DEVICE)).cpu().numpy().astype(np.float32))
     return np.concatenate(Z,0)
+_NEED_LATENT = RUN_LATENT or (VARIANT=="eval") or (VARIANT=="all")
 if RUN_LATENT:
     print("\nEncoding latents..."); tz=encode_all()
     z_mean=tz.reshape(-1,RVQ_CODE_DIM).mean(0).astype(np.float32); z_std=(tz.reshape(-1,RVQ_CODE_DIM).std(0)+1e-6).astype(np.float32)
     train_z=((tz-z_mean)/z_std).astype(np.float32); z_mean_t=torch.tensor(z_mean,device=DEVICE); z_std_t=torch.tensor(z_std,device=DEVICE)
+elif _NEED_LATENT:
+    # eval-only job: we still need the latent standardization stats for decoding,
+    # but not the full training-set latents. Estimate from a subset (fast, stable).
+    print("\n[eval] computing latent z-stats from a subset (no training latents needed)...")
+    with torch.no_grad():
+        _idx=random.sample(range(len(train_entries)),min(3000,len(train_entries)))
+        _zs=[]
+        for s in range(0,len(_idx),128):
+            _b=[pad_norm(train_entries[i]["motion"])[0] for i in _idx[s:s+128]]
+            _zs.append(rvq.encoder(torch.tensor(np.stack(_b),device=DEVICE)).cpu().numpy().astype(np.float32))
+        _tz=np.concatenate(_zs,0)
+    z_mean=_tz.reshape(-1,RVQ_CODE_DIM).mean(0).astype(np.float32); z_std=(_tz.reshape(-1,RVQ_CODE_DIM).std(0)+1e-6).astype(np.float32)
+    z_mean_t=torch.tensor(z_mean,device=DEVICE); z_std_t=torch.tensor(z_std,device=DEVICE)
+    print(f"  z-stats ready (mean|{z_mean.mean():.4f}| std|{z_std.mean():.4f}|)")
 
 # %% [code]
 # Cell 8: models (latent FM + direct DiT) + projected samplers
@@ -376,15 +394,19 @@ def _joints_to_norm(J,base_mn):
 
 @torch.no_grad()
 def sample(net,is_latent,tseq,tmask,tpool,length,n=ODE_STEPS,guidance=GUIDANCE,mode="none",seed=None):
-    """mode: 'none' | 'posthoc' | 'inproc'. Returns normalized-263 motion (B,T,263)."""
+    """mode: 'none' | 'posthoc' | 'inproc'. Returns normalized-263 motion (B,T,263).
+    In-process schedule is controlled by globals PROJ_WINDOW (fraction of final steps to
+    project over, e.g. 0.5 = second half) and PROJ_STRIDE (apply every k-th step)."""
     if seed is not None: torch.manual_seed(seed)
     B=tpool.shape[0]; cd=net.cd; Tl=net.Tlen
     z=torch.randn(B,Tl,cd,device=DEVICE); ns=net.null_seq.unsqueeze(0).expand(B,-1,-1); nm=torch.ones(B,T5_MAXLEN,dtype=torch.bool,device=DEVICE); npl=net.null_pool.unsqueeze(0).expand(B,-1); dt=1.0/n
+    _win=float(globals().get("PROJ_WINDOW",0.5)); _stride=int(globals().get("PROJ_STRIDE",1))
+    _start=int(round(n*(1.0-_win)))     # first step at which in-process projection engages
     for i in range(n):
         t=torch.full((B,),i*dt,device=DEVICE); v=net(z,t,tseq,tmask,tpool,length)
         if guidance!=1.0: vu=net(z,t,ns,nm,npl,length); v=vu+guidance*(v-vu)
         z=z+dt*v
-        if mode=="inproc" and i>=n//2:   # guide during 2nd half: decode-project-(re)encode
+        if mode=="inproc" and i>=_start and ((i-_start)%_stride==0):   # decode-project-(re)encode
             mn=(rvq.decoder(z*z_std_t+z_mean_t) if is_latent else z)
             J=project_joints(_gj(mn),length); mn2=_joints_to_norm(J,mn)
             z=(rvq.encoder(mn2) if is_latent else mn2)
@@ -574,9 +596,15 @@ _RUN_TABLE = (VARIANT in ("all","eval"))
 # %% [code]
 # Cell 12: ============ TABLE: evaluate every variant ============
 def load_net(tag,is_latent):
+    global z_mean_t,z_std_t
     bp=os.path.join(CK,f"{tag}_best.pt"); ck=torch.load(bp,map_location=DEVICE,weights_only=False)
     cd=RVQ_CODE_DIM if is_latent else NFEATS; Tl=T_LAT if is_latent else MAX_MOTION_LEN
-    net=FMNet(cd,Tl,LHID if is_latent else DHID,LLAYERS if is_latent else DLAYERS,LHEADS if is_latent else DHEADS).to(DEVICE); net.load_state_dict(ck["state"]); net.eval(); return net
+    net=FMNet(cd,Tl,LHID if is_latent else DHID,LLAYERS if is_latent else DLAYERS,LHEADS if is_latent else DHEADS).to(DEVICE); net.load_state_dict(ck["state"]); net.eval()
+    # restore the EXACT latent standardization used when this checkpoint was trained
+    if is_latent and isinstance(ck,dict) and ck.get("z_mean") is not None and ck.get("z_std") is not None:
+        z_mean_t=torch.tensor(ck["z_mean"],device=DEVICE).float(); z_std_t=torch.tensor(ck["z_std"],device=DEVICE).float()
+        print(f"    [{tag}] restored z-stats from checkpoint")
+    return net
 def _agg(a): return float(a.mean()),float(np.percentile(a,95)),float(a.max())
 @torch.no_grad()
 def eval_variant(net,is_latent,mode,N=EVAL_N):
@@ -599,7 +627,10 @@ def eval_variant(net,is_latent,mode,N=EVAL_N):
 rows=[]  # (label, dict)
 def add(label,net,is_latent,mode): print(f"  eval: {label}"); rows.append((label,eval_variant(net,is_latent,mode)))
 def _have(tag): return os.path.exists(os.path.join(CK,f"{tag}_best.pt"))
-if not _RUN_TABLE:
+_ABLATION_IMPORT = os.environ.get("ABLATION_IMPORT","0")=="1"
+if _ABLATION_IMPORT:
+    print("[imported for ablation] models/data/evaluator loaded; skipping the full eval table.")
+elif not _RUN_TABLE:
     print(f"\nVARIANT={VARIANT}: single-base training job done. Table/figures are produced by the eval job (VARIANT=eval).")
 else:
   if _have("latent"):
@@ -641,6 +672,10 @@ if _RUN_TABLE and rows:
 # Cell 13: ============ QUALITATIVE FIGURES ============
 # Single-base training jobs (VARIANT=latent/direct/...) finish here — the eval job
 # (VARIANT=eval, after all bases are trained) produces the figures + GIFs below.
+# When imported for an ablation, raise a sentinel the importer catches, so module load
+# stops here cleanly without running figures and without killing the importing process.
+if _ABLATION_IMPORT:
+    raise M_ABLATION_STOP("models loaded; ablation takes over")
 if not (_RUN_TABLE and rows):
     if WB is not None:
         try: WB.finish()
@@ -678,6 +713,9 @@ if rows:
         axes[2].set_title("BLE distribution (eval set)"); axes[2].set_xlabel("BLE (m)"); axes[2].set_yticks([]); axes[2].legend(fontsize=8)
 fig.suptitle(f'"{cap[:70]}"',fontsize=10); fig.tight_layout(); pth=os.path.join(FIG,"qualitative.png"); fig.savefig(pth,bbox_inches="tight"); plt.close(fig)
 display(HTML(f'<img src="data:image/png;base64,{base64.b64encode(open(pth,"rb").read()).decode()}" style="width:980px">')); print("saved",pth)
+if WB is not None:
+    try: WB.log({"figures/qualitative_traces":WB.Image(pth,caption=f'BLE + foot traces — "{cap[:60]}"')})
+    except Exception as _e: print("  wandb figure log failed:",_e)
 
 # (4) skeleton render strips (unconstrained vs projected) at a few frames
 def strip(J,color,title):
@@ -689,6 +727,9 @@ def strip(J,color,title):
 for J,c,t,nm in [(Ju,"#e74c3c","unconstrained (note limb stretch / foot slide)","q_unc"),(Jp,"#2ecc71","projected (BLE=0, foot planted)","q_prj")]:
     f=strip(J,c,t); pp=os.path.join(FIG,nm+".png"); f.savefig(pp,bbox_inches="tight"); plt.close(f)
     display(HTML(f'<img src="data:image/png;base64,{base64.b64encode(open(pp,"rb").read()).decode()}" style="width:980px">'))
+    if WB is not None:
+        try: WB.log({f"figures/skeleton_{nm}":WB.Image(pp,caption=t)})
+        except Exception as _e: print("  wandb strip log failed:",_e)
 print("Done. Table arrays + figures saved under",PROJ)
 
 # %% [code]
@@ -696,8 +737,8 @@ print("Done. Table arrays + figures saved under",PROJ)
 # One animated GIF per variant, laid out side-by-side per prompt so the
 # unconstrained-vs-projected difference (limb stretch / foot slide) is visible.
 from PIL import Image as _Image
-def render_gif_b64(J,title="",color="#3498db",max_frames=40,fps=15):
-    """J:(T,22,3) absolute joints -> base64 animated GIF (3D skeleton)."""
+def render_gif(J,path,title="",color="#3498db",max_frames=40,fps=15):
+    """J:(T,22,3) absolute joints -> saves an animated GIF to `path`; returns base64 too."""
     T=J.shape[0]; idx=np.linspace(0,T-1,min(max_frames,T)).astype(int); pad=0.4
     xmn,xmx=J[...,0].min()-pad,J[...,0].max()+pad; zmn,zmx=J[...,2].min()-pad,J[...,2].max()+pad
     ymn=min(J[...,1].min()-0.05,0.0); ymx=J[...,1].max()+0.3; span=max(xmx-xmn,zmx-zmn)
@@ -710,8 +751,8 @@ def render_gif_b64(J,title="",color="#3498db",max_frames=40,fps=15):
         ax.view_init(elev=12,azim=60); ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([]); ax.grid(False)
         if title: ax.set_title(title,fontsize=7)
         fig.tight_layout(pad=0.1); buf=io.BytesIO(); fig.savefig(buf,format="png",dpi=70); buf.seek(0); fr.append(_Image.open(buf).convert("RGB").copy()); buf.close(); plt.close(fig)
-    out=io.BytesIO(); fr[0].save(out,format="GIF",save_all=True,append_images=fr[1:],duration=int(1000/fps),loop=0); out.seek(0)
-    return base64.b64encode(out.read()).decode()
+    fr[0].save(path,format="GIF",save_all=True,append_images=fr[1:],duration=int(1000/fps),loop=0)   # <- file on disk (W&B can log it)
+    with open(path,"rb") as f: return base64.b64encode(f.read()).decode()
 
 # build the variant list (label, net, is_latent, mode, color) matching the table
 gif_variants=[]
@@ -729,13 +770,27 @@ if _have("direct"):
     gif_variants.append(("CDFM in-process",_nD,False,"inproc","#1abc9c"))
 
 GIF_PROMPTS=[test_entries[int(sub_idx[0])]["texts"][0], "a person walks forward then turns around"]
-for prompt in GIF_PROMPTS:
+_gifdir=os.path.join(FIG,"gifs"); os.makedirs(_gifdir,exist_ok=True)
+for pi,prompt in enumerate(GIF_PROMPTS):
     tq=embed_text([prompt]); tq=[torch.tensor(a,device=DEVICE) for a in tq]; Lq=(min(MAX_MOTION_LEN,140)//UNIT_LEN)*UNIT_LEN
-    cells=[]
+    cells=[]; _wb_media={}
     for label,net,isL,mode,col in gif_variants:
         x=sample(net,isL,tq[0],tq[1],tq[2],torch.tensor([Lq],device=DEVICE),mode=mode,seed=7); J=_gj(x)[0,:Lq].cpu().numpy()
-        b=render_gif_b64(J,title=label,color=col)
+        _safe=label.replace(" ","_").replace("+","").replace("-","_")
+        _gp=os.path.join(_gifdir,f"p{pi}_{_safe}.gif")
+        b=render_gif(J,_gp,title=label,color=col)
         cells.append(f'<div style="text-align:center;margin:3px"><img src="data:image/gif;base64,{b}" style="width:190px;border:1px solid #ddd;border-radius:4px"></div>')
+        if WB is not None:
+            try: _wb_media[f"gifs/prompt{pi}/{_safe}"]=WB.Video(_gp,caption=f"{label} — \"{prompt[:60]}\"",format="gif")
+            except Exception:
+                try: _wb_media[f"gifs/prompt{pi}/{_safe}"]=WB.Image(_gp,caption=f"{label} — \"{prompt[:60]}\"")
+                except Exception as _e: print("  wandb gif log failed:",_e)
+    if WB is not None and _wb_media:
+        try: WB.log(_wb_media); print(f"  logged {len(_wb_media)} GIFs to W&B (prompt {pi})")
+        except Exception as _e: print("  wandb gif log failed:",_e)
     display(HTML(f'<div style="font-family:monospace;font-size:12px;margin:10px 0 4px;padding:5px 9px;background:#eef;border-left:4px solid #36c">&#9658; "{prompt[:80]}" (same seed across variants)</div>'
                  f'<div style="display:flex;flex-wrap:wrap;gap:3px">{"".join(cells)}</div>'))
-print("GIF comparison done — same prompt+seed across variants; watch limbs/feet on unconstrained vs projected.")
+print(f"GIF comparison done — files under {_gifdir}; same prompt+seed across variants.")
+if WB is not None:
+    try: WB.finish()
+    except Exception: pass
