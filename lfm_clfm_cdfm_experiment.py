@@ -405,6 +405,18 @@ def sample(net,is_latent,tseq,tmask,tpool,length,n=ODE_STEPS,guidance=GUIDANCE,m
     for i in range(n):
         t=torch.full((B,),i*dt,device=DEVICE); v=net(z,t,tseq,tmask,tpool,length)
         if guidance!=1.0: vu=net(z,t,ns,nm,npl,length); v=vu+guidance*(v-vu)
+        if mode=="guided":
+            # SOFT inference-time guidance (the Feng-et-al / GuideFlow paradigm): add the gradient
+            # of the differentiable constraint violation to the velocity. For latent models this
+            # backprops the constraint gradient THROUGH the frozen decoder into the latent — the
+            # same round trip the ceiling argument concerns.
+            _gw=float(globals().get("GUIDE_W",0.0))
+            if _gw>0.0:
+                zc=z.detach().requires_grad_(True)
+                mnc=(rvq.decoder(zc*z_std_t+z_mean_t) if is_latent else zc)
+                pen=diff_penalty(mnc,length)
+                g=torch.autograd.grad(pen,zc)[0]
+                v=v-_gw*g            # steer velocity down the constraint-violation gradient
         z=z+dt*v
         if mode=="inproc" and i>=_start and ((i-_start)%_stride==0):   # decode-project-(re)encode
             mn=(rvq.decoder(z*z_std_t+z_mean_t) if is_latent else z)
