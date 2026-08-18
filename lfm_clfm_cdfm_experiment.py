@@ -393,37 +393,65 @@ def _joints_to_norm(J,base_mn):
     raw=base_mn*std_t+mean_t; raw2=inverse_ric(J,raw); return (raw2-mean_t)/std_t
 
 @torch.no_grad()
-def sample(net,is_latent,tseq,tmask,tpool,length,n=ODE_STEPS,guidance=GUIDANCE,mode="none",seed=None):
-    """mode: 'none' | 'posthoc' | 'inproc'. Returns normalized-263 motion (B,T,263).
-    In-process schedule is controlled by globals PROJ_WINDOW (fraction of final steps to
-    project over, e.g. 0.5 = second half) and PROJ_STRIDE (apply every k-th step)."""
+def _timesteps(n, schedule="linear"):
+    """ODE time grid on [0,1]. 'linear' | 'cosine' (dense near 1) | 'quadratic' (dense near 1)."""
+    import numpy as _np
+    u=_np.linspace(0,1,n+1)
+    if schedule=="cosine":   ts=1-_np.cos(u*_np.pi/2)      # dense near t=1
+    elif schedule=="quadratic": ts=u**2                     # dense near t=0... use 1-(1-u)**2 for near 1
+    elif schedule=="power":  ts=1-(1-u)**2                  # dense near t=1
+    else: ts=u
+    return ts
+
+def _cfg(net,z,t,tseq,tmask,tpool,length,ns,nm,npl,guidance,cfg_rescale):
+    v=net(z,t,tseq,tmask,tpool,length)
+    if guidance!=1.0:
+        vu=net(z,t,ns,nm,npl,length); vg=vu+guidance*(v-vu)
+        if cfg_rescale>0.0:   # rescale guided velocity's std back toward the conditional std (Lin et al.)
+            sc=v.flatten(1).std(dim=1).clamp_min(1e-8)/vg.flatten(1).std(dim=1).clamp_min(1e-8)
+            sc=sc.view(-1,*([1]*(v.dim()-1)))
+            vg=cfg_rescale*(vg*sc)+(1-cfg_rescale)*vg
+        return vg
+    return v
+
+def sample(net,is_latent,tseq,tmask,tpool,length,n=ODE_STEPS,guidance=GUIDANCE,mode="none",seed=None,guide_w=None,
+           cfg_rescale=0.0,schedule="linear",solver="euler",gw_schedule="const"):
+    """mode: 'none'|'posthoc'|'inproc'|'guided'. Inference-time knobs (all opt-in, default=original):
+    cfg_rescale (0..1 std-rescale of CFG), schedule ('linear'|'cosine'|'power'), solver ('euler'|'heun'),
+    gw_schedule ('const'|'sin'|'decay') shapes the guidance weight over t."""
     if seed is not None: torch.manual_seed(seed)
     B=tpool.shape[0]; cd=net.cd; Tl=net.Tlen
-    z=torch.randn(B,Tl,cd,device=DEVICE); ns=net.null_seq.unsqueeze(0).expand(B,-1,-1); nm=torch.ones(B,T5_MAXLEN,dtype=torch.bool,device=DEVICE); npl=net.null_pool.unsqueeze(0).expand(B,-1); dt=1.0/n
+    z=torch.randn(B,Tl,cd,device=DEVICE); ns=net.null_seq.unsqueeze(0).expand(B,-1,-1); nm=torch.ones(B,T5_MAXLEN,dtype=torch.bool,device=DEVICE); npl=net.null_pool.unsqueeze(0).expand(B,-1)
     _win=float(globals().get("PROJ_WINDOW",0.5)); _stride=int(globals().get("PROJ_STRIDE",1))
-    _start=int(round(n*(1.0-_win)))     # first step at which in-process projection engages
+    _gw = float(guide_w) if guide_w is not None else float(globals().get("GUIDE_W",0.0))
+    _start=int(round(n*(1.0-_win)))
+    ts=_timesteps(n,schedule)
     for i in range(n):
-        t=torch.full((B,),i*dt,device=DEVICE); v=net(z,t,tseq,tmask,tpool,length)
-        if guidance!=1.0: vu=net(z,t,ns,nm,npl,length); v=vu+guidance*(v-vu)
-        if mode=="guided":
-            # SOFT inference-time guidance (the Feng-et-al / GuideFlow paradigm): add the gradient
-            # of the differentiable constraint violation to the velocity. For latent models this
-            # backprops the constraint gradient THROUGH the frozen decoder into the latent — the
-            # same round trip the ceiling argument concerns.
-            _gw=float(globals().get("GUIDE_W",0.0))
-            if _gw>0.0:
-                zc=z.detach().requires_grad_(True)
-                mnc=(rvq.decoder(zc*z_std_t+z_mean_t) if is_latent else zc)
-                pen=diff_penalty(mnc,length)
-                g=torch.autograd.grad(pen,zc)[0]
-                v=v-_gw*g            # steer velocity down the constraint-violation gradient
+        tval=float(ts[i]); dt=float(ts[i+1]-ts[i])
+        t=torch.full((B,),tval,device=DEVICE)
+        v=_cfg(net,z,t,tseq,tmask,tpool,length,ns,nm,npl,guidance,cfg_rescale)
+        if solver=="heun" and i<n-1:     # 2nd-order: predict, evaluate at endpoint, average
+            z_pred=z+dt*v; t2=torch.full((B,),float(ts[i+1]),device=DEVICE)
+            v2=_cfg(net,z_pred,t2,tseq,tmask,tpool,length,ns,nm,npl,guidance,cfg_rescale)
+            v=0.5*(v+v2)
+        if mode=="guided" and _gw>0.0:
+            gwt=_gw*( math.sin(math.pi*tval) if gw_schedule=="sin" else (1-tval) if gw_schedule=="decay" else 1.0)
+            if gwt>0.0:
+                with torch.enable_grad():
+                    zc=z.detach().requires_grad_(True)
+                    mnc=(rvq.decoder(zc*z_std_t+z_mean_t) if is_latent else zc)
+                    pen=diff_penalty(mnc,length)
+                    g=torch.autograd.grad(pen,zc)[0]
+                g = g / (g.flatten(1).norm(dim=1).clamp_min(1e-8).view(-1,1,1))
+                vmag = v.flatten(1).norm(dim=1).view(-1,1,1)
+                v = v - gwt * g * vmag
         z=z+dt*v
-        if mode=="inproc" and i>=_start and ((i-_start)%_stride==0):   # decode-project-(re)encode
+        if mode=="inproc" and i>=_start and ((i-_start)%_stride==0):
             mn=(rvq.decoder(z*z_std_t+z_mean_t) if is_latent else z)
             J=project_joints(_gj(mn),length); mn2=_joints_to_norm(J,mn)
             z=(rvq.encoder(mn2) if is_latent else mn2)
     mn=(rvq.decoder(z*z_std_t+z_mean_t) if is_latent else z)
-    if mode in ("posthoc","inproc"):     # final projection GUARANTEES BLE->0 exactly on output
+    if mode in ("posthoc","inproc"):
         J=project_joints(_gj(mn),length); mn=_joints_to_norm(J,mn)
     return mn
 
@@ -619,14 +647,14 @@ def load_net(tag,is_latent):
     return net
 def _agg(a): return float(a.mean()),float(np.percentile(a,95)),float(a.max())
 @torch.no_grad()
-def eval_variant(net,is_latent,mode,N=EVAL_N):
+def eval_variant(net,is_latent,mode,N=EVAL_N,guide_w=None,cfg_rescale=0.0,schedule="linear",solver="euler",gw_schedule="const",n_steps=ODE_STEPS):
     rng=np.random.default_rng(0); sel=np.array(sorted(rng.permutation(len(test_entries))[:N].tolist()))
     caps=[test_entries[int(i)]["texts"][0] for i in sel]; lens=torch.tensor([int(test_lens[i]) for i in sel],device=DEVICE)
     tseq,tmask,tpool=embed_text(caps); fsr=[]; ble=[]; mf=[]
     real_mf=[]
     for s in range(0,N,32):
         e=min(s+32,N); ts=torch.tensor(tseq[s:e],device=DEVICE); tm=torch.tensor(tmask[s:e],device=DEVICE); tp=torch.tensor(tpool[s:e],device=DEVICE)
-        x=sample(net,is_latent,ts,tm,tp,lens[s:e],mode=mode,seed=s); gm=lengths_to_mask(lens[s:e],MAX_MOTION_LEN); J=_gj(x)
+        x=sample(net,is_latent,ts,tm,tp,lens[s:e],n=n_steps,mode=mode,seed=s,guide_w=guide_w,cfg_rescale=cfg_rescale,schedule=schedule,solver=solver,gw_schedule=gw_schedule); gm=lengths_to_mask(lens[s:e],MAX_MOTION_LEN); J=_gj(x)
         fsr.append(fsr_pc(J,lens[s:e])); ble.append(ble_pc_joints(J,lens[s:e]))
         if EVAL_ENABLED:
             mf.append(memb(x*gm[...,None],lens[s:e]))
