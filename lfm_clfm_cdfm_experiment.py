@@ -647,14 +647,16 @@ def load_net(tag,is_latent):
     return net
 def _agg(a): return float(a.mean()),float(np.percentile(a,95)),float(a.max())
 @torch.no_grad()
-def eval_variant(net,is_latent,mode,N=EVAL_N,guide_w=None,cfg_rescale=0.0,schedule="linear",solver="euler",gw_schedule="const",n_steps=ODE_STEPS):
+def eval_variant(net,is_latent,mode,N=EVAL_N,guide_w=None,cfg_rescale=0.0,schedule="linear",solver="euler",gw_schedule="const",n_steps=ODE_STEPS,seed_offset=0):
     rng=np.random.default_rng(0); sel=np.array(sorted(rng.permutation(len(test_entries))[:N].tolist()))
     caps=[test_entries[int(i)]["texts"][0] for i in sel]; lens=torch.tensor([int(test_lens[i]) for i in sel],device=DEVICE)
     tseq,tmask,tpool=embed_text(caps); fsr=[]; ble=[]; mf=[]
     real_mf=[]
     for s in range(0,N,32):
         e=min(s+32,N); ts=torch.tensor(tseq[s:e],device=DEVICE); tm=torch.tensor(tmask[s:e],device=DEVICE); tp=torch.tensor(tpool[s:e],device=DEVICE)
-        x=sample(net,is_latent,ts,tm,tp,lens[s:e],n=n_steps,mode=mode,seed=s,guide_w=guide_w,cfg_rescale=cfg_rescale,schedule=schedule,solver=solver,gw_schedule=gw_schedule); gm=lengths_to_mask(lens[s:e],MAX_MOTION_LEN); J=_gj(x)
+        # seed_offset varies the SAMPLING noise per replication; the clip set (sel) stays fixed,
+        # so replications measure the same clips under different noise -> honest run-to-run variance.
+        x=sample(net,is_latent,ts,tm,tp,lens[s:e],n=n_steps,mode=mode,seed=s+seed_offset*100000,guide_w=guide_w,cfg_rescale=cfg_rescale,schedule=schedule,solver=solver,gw_schedule=gw_schedule); gm=lengths_to_mask(lens[s:e],MAX_MOTION_LEN); J=_gj(x)
         fsr.append(fsr_pc(J,lens[s:e])); ble.append(ble_pc_joints(J,lens[s:e]))
         if EVAL_ENABLED:
             mf.append(memb(x*gm[...,None],lens[s:e]))
