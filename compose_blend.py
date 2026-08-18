@@ -27,6 +27,23 @@ DEVICE=M.DEVICE; NFEATS=M.NFEATS; N_JOINTS=M.N_JOINTS; T5_MAXLEN=M.T5_MAXLEN
 ODE=M.ODE_STEPS; GUID=M.GUIDANCE; MAXLEN=M.MAX_MOTION_LEN; UNIT=M.UNIT_LEN
 _CHAINS=M._CHAINS
 
+# self-contained GIF renderer (M.render_gif is defined after the ablation sentinel, so unavailable here)
+import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt, io as _io
+from PIL import Image as _PImage
+def _render_gif(J,path,title="",color="#8e44ad",max_frames=40,fps=15):
+    T=J.shape[0]; idx=np.linspace(0,T-1,min(max_frames,T)).astype(int); pad=0.4
+    xmn,xmx=J[...,0].min()-pad,J[...,0].max()+pad; zmn,zmx=J[...,2].min()-pad,J[...,2].max()+pad
+    ymn=min(J[...,1].min()-0.05,0.0); ymx=J[...,1].max()+0.3; span=max(xmx-xmn,zmx-zmn,1e-3); fr=[]
+    for t in idx:
+        fig=plt.figure(figsize=(2.6,2.6),dpi=70); ax=fig.add_subplot(111,projection="3d")
+        for ch in _CHAINS: ax.plot([J[t,k,0] for k in ch],[J[t,k,2] for k in ch],[J[t,k,1] for k in ch],color=color,lw=2,marker="o",ms=2.5)
+        ax.set_xlim(xmn,xmx); ax.set_ylim(zmn,zmx); ax.set_zlim(ymn,ymx); ax.set_box_aspect([1,1,max(0.4,(ymx-ymn)/span)])
+        ax.view_init(elev=12,azim=60); ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([]); ax.grid(False)
+        if title: ax.set_title(title,fontsize=7)
+        fig.tight_layout(pad=0.1); buf=_io.BytesIO(); fig.savefig(buf,format="png",dpi=70); buf.seek(0)
+        fr.append(_PImage.open(buf).convert("RGB").copy()); buf.close(); plt.close(fig)
+    fr[0].save(path,format="GIF",save_all=True,append_images=fr[1:],duration=int(1000/fps),loop=0)
+
 BASE=os.environ.get("COMPOSE_BASE","direct"); IS_LAT=(BASE=="direct" and False) or (BASE=="latent")
 net=M.load_net(BASE, IS_LAT)
 
@@ -93,7 +110,8 @@ for pi,(pu,pl) in enumerate(PAIRS):
     bone=np.linalg.norm(J[:,[e[0] for e in M.EDGES],:]-J[:,[e[1] for e in M.EDGES],:],axis=-1)
     ble=float(np.abs(bone-M.rest_len.cpu().numpy()).mean())
     gp=_os.path.join(_cdir,f"compose_{pi}.gif")
-    M.render_gif(J, gp, title=f"U:{pu[:20]} / L:{pl[:20]}", color="#8e44ad")
+    M_render = _render_gif
+    M_render(J, gp, title=f"U:{pu[:20]} / L:{pl[:20]}", color="#8e44ad")
     print(f"  [{pi}] upper='{pu}'  lower='{pl}'  -> BLE={ble:.4f}  gif={gp}")
     try: wandb.log({f"compose/pair{pi}": wandb.Video(gp, caption=f"U:{pu} | L:{pl}", format="gif")})
     except Exception:
