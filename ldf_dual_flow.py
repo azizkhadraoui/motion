@@ -61,7 +61,7 @@ project_joints = M.project_joints; _gj = M._gj; _joints_to_norm = M._joints_to_n
 EI = torch.tensor([e[0] for e in EDGES], device=DEVICE)
 EJ = torch.tensor([e[1] for e in EDGES], device=DEVICE)
 
-C_GRID   = [float(x) for x in os.environ.get("LDF_C", "0.1,1.0,10.0").split(",")]
+C_GRID   = [float(x) for x in os.environ.get("LDF_C", "10,100,1000,10000").split(",")]
 P_GRID   = [float(x) for x in os.environ.get("LDF_P", "1,2,3").split(",")]
 NSTEPS   = [int(x)   for x in os.environ.get("LDF_STEPS", "50,100").split(",")]
 EPS      = float(os.environ.get("LDF_EPS", "1e-3"))     # floor on (1-t) in the dual gain
@@ -82,7 +82,7 @@ def constraint(y, is_lat, L):
 def make_ldf_sampler(orig):
     def s(net, is_latent, tseq, tmask, tpool, length, n=ODE, guidance=GUID, mode="none", seed=None,
           guide_w=None, cfg_rescale=0.0, schedule="linear", solver="euler", gw_schedule="const"):
-        if mode not in ("ldf", "ldf_proj"):
+        if mode not in ("ldf", "ldf_proj", "ldf_ctl"):
             return orig(net, is_latent, tseq, tmask, tpool, length, n=n, guidance=guidance, mode=mode,
                         seed=seed, guide_w=guide_w, cfg_rescale=cfg_rescale, schedule=schedule,
                         solver=solver, gw_schedule=gw_schedule)
@@ -99,19 +99,25 @@ def make_ldf_sampler(orig):
             tt = torch.full((B,), t, device=DEVICE)
             with torch.no_grad():
                 v = _cfg(net, x, tt, tseq, tmask, tpool, length, ns, nm, npl, guidance, cfg_rescale)
-            # single VJP: J_g^T (lambda + c*g), with the weight detached
-            with torch.enable_grad():
-                xc = x.detach().requires_grad_(True)
-                g = constraint(xc, is_latent, length)
-                w = (lam + LDF_C * g).detach()
-                corr = torch.autograd.grad((w * g).sum(), xc)[0]
+            if mode == "ldf_ctl":
+                corr = torch.zeros_like(x)          # CONTROL: plain ODE, tracing only
+            else:
+                # single VJP: J_g^T (lambda + c*g), with the weight detached
+                with torch.enable_grad():
+                    xc = x.detach().requires_grad_(True)
+                    g = constraint(xc, is_latent, length)
+                    w = (lam + LDF_C * g).detach()
+                    corr = torch.autograd.grad((w * g).sum(), xc)[0]
             with torch.no_grad():
                 gd = constraint(x, is_latent, length)
                 if TRACE is not None:
                     TRACE.append((t, float(gd.pow(2).sum(dim=(1, 2)).sqrt().mean()),
-                                  float(lam.abs().mean())))
+                                  float(lam.abs().mean()),
+                                  float(corr.flatten(1).norm(dim=1).mean()),
+                                  float(v.flatten(1).norm(dim=1).mean())))
                 x = x + dt * (v - corr)
-                lam = lam + dt * gd / max((1.0 - t), EPS) ** LDF_P     # lambda-dot = g/(1-t)^p
+                if mode != "ldf_ctl":
+                    lam = lam + dt * gd / max((1.0 - t), EPS) ** LDF_P   # lambda-dot = g/(1-t)^p
         mn = decode(x, is_latent)
         if mode == "ldf_proj":
             mn = _joints_to_norm(project_joints(_gj(mn), length), mn)
@@ -120,7 +126,7 @@ def make_ldf_sampler(orig):
 
 def fit_alpha(trace, frac=0.5):
     """Least-squares fit of log||g|| = const + alpha*log(1-t) over the final `frac` of the trajectory."""
-    pts = [(t, gn) for t, gn, _ in trace if gn > 0 and (1 - t) > 1e-6]
+    pts = [(t, r[0]) for t, *r in trace if r[0] > 0 and (1 - t) > 1e-6]
     pts = pts[int(len(pts) * (1 - frac)):]
     if len(pts) < 4: return float("nan")
     X = np.log(np.array([1 - t for t, _ in pts])); Y = np.log(np.array([g for _, g in pts]))
@@ -154,6 +160,20 @@ try:
               f"{rows[-2]['FID']}, post-decode {rows[-1]['FID']} at BLE 0\n{'='*104}")
 
         M.sample = make_ldf_sampler(orig)
+        globals()["TRACE"] = []
+        rc = eval_variant(net, is_lat, "ldf_ctl", n_steps=ODE)
+        ctl = list(globals()["TRACE"]); globals()["TRACE"] = None
+        a_ctl = fit_alpha(ctl)
+        bc, _, _ = _agg(rc["ble"])
+        print(f"  CONTROL (plain ODE, no correction): BLE={bc:.5f}  ||g||: {ctl[0][1]:.4f} -> "
+              f"{ctl[-1][1]:.5f}  alpha_control={a_ctl:.3f}")
+        print("  Any LDF alpha must be read AGAINST this: the residual falls steeply under the")
+        print("  unconstrained flow too, simply because x_0 is noise. Only the excess over")
+        print("  alpha_control is attributable to the dual flow.")
+        traces[f"{tag}_CONTROL"] = ctl[::max(1, len(ctl) // 60)]
+        rows.append(dict(base=tag, method="control (traced plain ODE)", c=None, p=None, n=ODE,
+                         FID=round(float(rc["fid"]), 4), R3=round(float(rc["R3"]), 4),
+                         BLE=round(bc, 5), alpha=round(a_ctl, 3) if a_ctl == a_ctl else None))
         for n in NSTEPS:
             for p in P_GRID:
                 for c in C_GRID:
@@ -169,10 +189,13 @@ try:
                                BLE=round(bm, 5), BLE_max=round(bx, 5), FSR=round(fm, 4),
                                alpha=round(a, 3) if a == a else None,
                                g0=round(tr[0][1], 4) if tr else None,
-                               gT=round(tr[-1][1], 5) if tr else None, sec=round(time.time() - t0))
+                               gT=round(tr[-1][1], 5) if tr else None,
+                               corr_ratio=round(float(np.mean([r[2] / max(r[3], 1e-9) for _, *r in tr])), 5) if tr else None,
+                               sec=round(time.time() - t0))
                     rows.append(row); traces[f"{tag}_c{c}_p{p}_n{n}"] = tr[::max(1, len(tr) // 60)]
-                    print(f"  c={c:<6} p={p:<4} n={n:<4} FID={row['FID']:<9} R@3={row['R3']:<7} "
-                          f"BLE={row['BLE']:<9} ||g||: {row['g0']} -> {row['gT']}  alpha={row['alpha']} ({row['sec']}s)")
+                    print(f"  c={c:<7} p={p:<4} n={n:<4} FID={row['FID']:<9} R@3={row['R3']:<7} "
+                          f"BLE={row['BLE']:<9} ||g||->{row['gT']:<9} alpha={row['alpha']:<7} "
+                          f"|corr|/|v|={row['corr_ratio']} ({row['sec']}s)")
                     wandb.log({f"ldf/{tag}/FID": row["FID"], f"ldf/{tag}/BLE": row["BLE"],
                                f"ldf/{tag}/alpha": row["alpha"] or 0.0, "ldf/c": c, "ldf/p": p})
         # best LDF config, then LDF followed by post-decode projection
@@ -238,7 +261,7 @@ try:
     fig, ax = plt.subplots(figsize=(3.6, 2.4))
     for k, tr in traces.items():
         if not tr: continue
-        ax.plot([1 - t for t, _, _ in tr], [g for _, g, _ in tr], lw=1.0, label=k, alpha=0.85)
+        ax.plot([1 - t for t, *_ in tr], [r[0] for _, *r in tr], lw=1.0, label=k, alpha=0.85)
     ax.set_xscale("log"); ax.set_yscale("log"); ax.invert_xaxis()
     ax.set_xlabel("$1-t$ (integration progresses right to left)")
     ax.set_ylabel(r"$\|g(x_t)\|$")

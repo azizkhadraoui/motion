@@ -17,7 +17,7 @@ export WANDB_PROJECT=motion-clfm
 export WANDB_ENTITY=
 cd $WORK/code
 echo "RVQ_CKPT=$RVQ_CKPT"
-export LDF_C=${LDF_C:-0.1,1.0,10.0}
+export LDF_C=${LDF_C:-10,100,1000,10000}
 export LDF_P=${LDF_P:-1,2,3}
 export LDF_STEPS=${LDF_STEPS:-50,100}
 export LDF_BASES=${LDF_BASES:-direct,latent}

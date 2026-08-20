@@ -68,11 +68,11 @@ def ground_clamp(J):
 
 OPS = {
     "O0 none":                    lambda J, L: J,
-    "O1 bone only":               lambda J, L: project_bonelength(J, L),
-    "O2 foot->bone (current)":    lambda J, L: project_bonelength(project_foot(J, L), L),
-    "O3 foot->bone->foot":        lambda J, L: project_foot(project_bonelength(project_foot(J, L), L), L),
-    "O4 smooth->foot->bone":      lambda J, L: project_bonelength(project_foot(smooth_joints(J), L), L),
-    "O5 clamp->foot->bone":       lambda J, L: project_bonelength(project_foot(ground_clamp(J), L), L),
+    "O1 bone only":               lambda J, L: project_bonelength(J),
+    "O2 foot->bone (current)":    lambda J, L: project_bonelength(project_foot(J, L)),
+    "O3 foot->bone->foot":        lambda J, L: project_foot(project_bonelength(project_foot(J, L)), L),
+    "O4 smooth->foot->bone":      lambda J, L: project_bonelength(project_foot(smooth_joints(J), L)),
+    "O5 clamp->foot->bone":       lambda J, L: project_bonelength(project_foot(ground_clamp(J), L)),
 }
 
 def jerk(J, L):
