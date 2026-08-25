@@ -161,14 +161,14 @@ for tag in BASES:
                 tp = torch.tensor(TPOOL[s:e], device=DEVICE); L = lens_all[s:e]
                 gm = lengths_to_mask(L, MAXLEN)
                 x = sample_grid(net, is_lat, ts_, tm, tp, L, grid, seed=s)
-                mf.append(memb(x * gm[..., None], L)); bl.append(ble_pc_joints(_gj(x), L))
+                mf.append(memb(x * gm[..., None], L)); bl.append(np.asarray(ble_pc_joints(_gj(x), L)))
                 if real_mf is None:
                     rm = torch.tensor(np.stack([pad_norm(M.test_entries[int(i)]["motion"])[0] for i in sel[s:e]]), device=DEVICE)
                     rmf.append(memb(rm * gm[..., None], L))
             if real_mf is None: real_mf = np.concatenate(rmf, 0)
             G = np.concatenate(mf, 0)
             res[(n, name)] = dict(FID=float(fid_calc(G, real_mf)), R3=float(rprec(G, real_mf)[3]),
-                                  BLE=float(torch.cat(bl).mean()))
+                                  BLE=float(np.concatenate(bl).mean()))
             print(f"  n={n:<4} {name:<24} FID={res[(n,name)]['FID']:.4f}  R@3={res[(n,name)]['R3']:.4f}")
             wandb.log({f"sched/{tag}/{name}/FID": res[(n, name)]["FID"], "sched/n": n})
 
