@@ -63,6 +63,7 @@ EI = torch.tensor([e[0] for e in EDGES], device=DEVICE)
 EJ = torch.tensor([e[1] for e in EDGES], device=DEVICE)
 
 N     = int(os.environ.get("AT_N", "64"))
+ONLY  = os.environ.get("AT_ONLY", "").strip().lower()   # e.g. AT_ONLY=p1 to rerun just the control
 STEPS = int(os.environ.get("AT_STEPS", "20000"))
 LR    = float(os.environ.get("AT_LR", "0.02"))
 LOG   = int(os.environ.get("AT_LOG", "500"))
@@ -91,8 +92,9 @@ with torch.no_grad():
     Jtgt = project_joints(_gj(mn0), L)            # bone-valid target, BLE = 0
     mnp = _joints_to_norm(Jtgt, mn0)
     z_enc = rvq.encoder(mnp).clone()
+    mn_rec = rvq.decoder(z_enc).clone()      # the autoencoder reconstruction: BLE ~ 0.0065
     ble_fn, drift_fn, terms = make_metrics(L, Jtgt)
-    base_rt = ble_fn(_gj(rvq.decoder(z_enc)))
+    base_rt = ble_fn(_gj(mn_rec))
 print(f"[attain] {len(idx)} clips. Encoder round-trip BLE on the projected target: {base_rt:.5f}")
 
 import wandb
@@ -130,11 +132,23 @@ dec_x = lambda p: recover_from_ric(p * M.std_t + M.mean_t)
 rows = []
 
 print(f"\n{'='*104}\nP1 — OPTIMIZER CONTROL (optimize the motion directly, no decoder)\n{'='*104}")
-rows.append(optimize(mnp, dec_x, "P1 direct motion, no decoder", objective="ble"))
+# The control must START where the latent probe starts, i.e. from the autoencoder reconstruction
+# (BLE ~ 0.0065), not from the already-projected motion (BLE 0, nothing to descend). Same objective,
+# same optimizer, same initial BLE -- the only difference is that no decoder sits in the path, so a
+# plateau in P2 can be attributed to the decoder rather than to the optimization.
+rows.append(optimize(mn_rec, dec_x, "P1 direct motion, no decoder", objective="ble"))
 p1 = rows[-1]["ble"]
 if p1 > 1e-4:
     print(f"\n  WARNING: the control did not reach ~0 (got {p1:.5f}). The optimizer, not the decoder,")
     print("  is the binding constraint. Raise AT_STEPS or AT_LR before interpreting anything below.")
+
+if ONLY == "p1":
+    r = rows[-1]
+    print(f"\n  CONTROL RESULT: BLE {r['ble0']:.5f} -> {r['ble']:.5f}")
+    print("  Reaching ~0 here, from the same starting BLE as the latent probe, establishes that the")
+    print("  optimizer is not the binding constraint and that any latent-side plateau is the decoder.")
+    json.dump(dict(control=r), open(os.path.join(os.environ.get("WORK_DIR", "."), "todo11_control.json"), "w"), indent=2)
+    sys.exit(0)
 
 print(f"\n{'='*104}\nP2 — FREE ATTAINABILITY (optimize z, bone error only, three initializations)\n{'='*104}")
 torch.manual_seed(0)
