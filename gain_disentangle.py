@@ -108,12 +108,48 @@ def euclid_z(a, b):
 
 @torch.no_grad()
 def gain(z, is_lat, L, probes=PROBES, eps=EPS):
+    """Finite-difference estimate of the local gain of Psi at the state z.
+
+    NOTE ON WHAT THIS ESTIMATES. Averaging the response to isotropic random probes approximates
+    E_v ||J_Psi v||, closer to a normalized Frobenius norm than to the operator norm ||J_Psi||_2.
+    Report it as an estimate g-hat, not as ||J_Psi||."""
     base = _gj(decode(z, is_lat)); acc = torch.zeros(z.shape[0], device=z.device)
     for _ in range(probes):
         v = torch.randn_like(z)
         v = v / v.flatten(1).norm(dim=1).clamp_min(1e-8).view(-1, *([1] * (z.dim() - 1)))
         acc += rms_q(_gj(decode(z + eps * v, is_lat)), base, L) / eps
     return acc / probes
+
+@torch.no_grad()
+def gain_trajectory(net, is_lat, tseq, tmask, tpool, L, seed, ts_eval=(0.25, 0.5, 0.75, 1.0),
+                    n=None):
+    """Gain evaluated at several points ALONG the reference trajectory. Returns (mean, max).
+
+    Equation (2)'s constant is a supremum over a region, not a point evaluation, so a trajectory
+    maximum is closer to it than the terminal value alone -- though still over the trajectory rather
+    than over the endpoint segment, which `gain_segment` handles."""
+    n = n or N_REF
+    torch.manual_seed(seed); B = tpool.shape[0]
+    z = torch.randn(B, net.Tlen, net.cd, device=DEVICE)
+    ns = net.null_seq.unsqueeze(0).expand(B, -1, -1)
+    nm = torch.ones(B, T5_MAXLEN, dtype=torch.bool, device=DEVICE)
+    npl = net.null_pool.unsqueeze(0).expand(B, -1)
+    ts = _timesteps(n, "linear"); marks = set(int(round(x * n)) for x in ts_eval)
+    vals = []
+    for i in range(n):
+        if i in marks: vals.append(gain(z, is_lat, L))
+        t = torch.full((B,), float(ts[i]), device=DEVICE)
+        v = _cfg(net, z, t, tseq, tmask, tpool, L, ns, nm, npl, GUID, 0.0)
+        z = z + float(ts[i + 1] - ts[i]) * v
+    vals.append(gain(z, is_lat, L))
+    V = torch.stack(vals)
+    return V.mean(0), V.max(0).values, z
+
+@torch.no_grad()
+def gain_segment(z_approx, z_ref, is_lat, L):
+    """Gain at the midpoint of the segment joining the approximate and exact endpoints -- the region
+    Equation (2) actually concerns, and the only variant that depends on the step budget n."""
+    return gain(0.5 * (z_approx + z_ref), is_lat, L)
 
 @torch.no_grad()
 def terminal(net, is_lat, tseq, tmask, tpool, L, n, seed):
@@ -148,43 +184,57 @@ for tag in BASES:
     net = load_net(tag, is_lat)
     print(f"\n{'='*104}\nMODEL {tag}   {REPS} seeds x {N_EVAL} clips\n{'='*104}")
 
-    acc = {k: {n: [] for n in NFES} for k in ("gain_vs_Q_rms", "gain_vs_Q_mpjpe", "gain_vs_Z",
-                                              "curv_vs_Z", "partial_gain", "rms_vs_mpjpe")}
+    KEYS = ("gain_vs_Q_rms", "gain_vs_Q_mpjpe", "gain_vs_Z", "partial_gain", "rms_vs_mpjpe",
+            "gmean_vs_Z", "gmax_vs_Z", "gseg_vs_Z", "gseg_vs_Q_rms", "gmax_vs_Q_rms")
+    acc = {k: {n: [] for n in NFES} for k in KEYS}
     t0 = time.time()
     for rep in range(REPS):
-        G, CZ = [], []
+        G, GM, GX = [], [], []
+        GS = {n: [] for n in NFES}
         dQ_rms = {n: [] for n in NFES}; dQ_mp = {n: [] for n in NFES}; dZ = {n: [] for n in NFES}
         for s in range(0, N_EVAL, 32):
             e = min(s + 32, N_EVAL)
             ts_ = torch.tensor(TSEQ[s:e], device=DEVICE); tm = torch.tensor(TMASK[s:e], device=DEVICE)
             tp = torch.tensor(TPOOL[s:e], device=DEVICE); L = lens_all[s:e]
             seed = s + rep * 100000
-            zref = terminal(net, is_lat, ts_, tm, tp, L, N_REF, seed)
+            gmean, gmax, zref = gain_trajectory(net, is_lat, ts_, tm, tp, L, seed)
             Jref = _gj(decode(zref, is_lat))
-            G.append(gain(zref, is_lat, L).cpu())
+            G.append(gain(zref, is_lat, L).cpu()); GM.append(gmean.cpu()); GX.append(gmax.cpu())
             for n in NFES:
                 zn = terminal(net, is_lat, ts_, tm, tp, L, n, seed)
                 Jn = _gj(decode(zn, is_lat))
                 dQ_rms[n].append(rms_q(Jn, Jref, L).cpu())
                 dQ_mp[n].append(mpjpe_q(Jn, Jref, L).cpu())
                 dZ[n].append(euclid_z(zn, zref).cpu())
-        G = torch.cat(G).numpy()
+                GS[n].append(gain_segment(zn, zref, is_lat, L).cpu())
+        G = torch.cat(G).numpy(); GM = torch.cat(GM).numpy(); GX = torch.cat(GX).numpy()
         for n in NFES:
             a = torch.cat(dQ_rms[n]).numpy(); b = torch.cat(dQ_mp[n]).numpy(); c = torch.cat(dZ[n]).numpy()
+            gs = torch.cat(GS[n]).numpy()
             acc["gain_vs_Q_rms"][n].append(spearman(G, a))
             acc["gain_vs_Q_mpjpe"][n].append(spearman(G, b))
             acc["gain_vs_Z"][n].append(spearman(G, c))
             acc["partial_gain"][n].append(partial_spearman(G, a, c))
             acc["rms_vs_mpjpe"][n].append(spearman(a, b))
+            acc["gmean_vs_Z"][n].append(spearman(GM, c))
+            acc["gmax_vs_Z"][n].append(spearman(GX, c))
+            acc["gseg_vs_Z"][n].append(spearman(gs, c))
+            acc["gseg_vs_Q_rms"][n].append(spearman(gs, a))
+            acc["gmax_vs_Q_rms"][n].append(spearman(GX, a))
         print(f"  rep {rep+1}/{REPS}  ({(time.time()-t0)/60:.1f}m)")
 
     print(f"\n  {'quantity':<46}" + "".join(f"{'n='+str(n):>16}" for n in NFES))
     print("  " + "-" * (46 + 16 * len(NFES)))
-    rows = [("gain vs degradation in Q (rms)",      "gain_vs_Q_rms"),
-            ("gain vs degradation in Q (MPJPE)",    "gain_vs_Q_mpjpe"),
-            ("gain vs degradation in Z  <-- decisive", "gain_vs_Z"),
-            ("gain vs Q, controlling for Z (partial)", "partial_gain"),
-            ("rms vs MPJPE agreement (sanity)",     "rms_vs_mpjpe")]
+    rows = [("TERMINAL gain vs degradation in Q (rms)",   "gain_vs_Q_rms"),
+            ("TERMINAL gain vs degradation in Q (MPJPE)", "gain_vs_Q_mpjpe"),
+            ("TERMINAL gain vs degradation in Z  <-- decisive", "gain_vs_Z"),
+            ("TRAJ-MEAN gain vs degradation in Z",       "gmean_vs_Z"),
+            ("TRAJ-MAX  gain vs degradation in Z",       "gmax_vs_Z"),
+            ("SEGMENT   gain vs degradation in Z",       "gseg_vs_Z"),
+            ("SEGMENT   gain vs degradation in Q (rms)", "gseg_vs_Q_rms"),
+            ("TRAJ-MAX  gain vs degradation in Q (rms)", "gmax_vs_Q_rms"),
+            ("TERMINAL gain vs Q, controlling for Z",    "partial_gain"),
+            ("rms vs MPJPE agreement (sanity)",          "rms_vs_mpjpe")]
     for lab, k in rows:
         print(f"  {lab:<46}" + "".join(f"{ci95(acc[k][n])[0]:>10.3f}+/-{ci95(acc[k][n])[1]:<5.3f}" for n in NFES))
 
@@ -212,6 +262,25 @@ for tag in BASES:
         print("        columns and describe it as partially confounded rather than picking a side.")
     print(f"\n    rms/MPJPE rank agreement: {agree:.3f}. The two norms order clips near-identically,")
     print("    so stating the analysis in rms and reporting MPJPE changes no conclusion.")
+
+    # which evaluation point best matches the constant in Equation (2)?
+    lo, hi = NFES[0], NFES[-1]
+    seg_lo = ci95(acc["gseg_vs_Q_rms"][lo])[0]; ter_lo = ci95(acc["gain_vs_Q_rms"][lo])[0]
+    seg_hi = ci95(acc["gseg_vs_Q_rms"][hi])[0]; ter_hi = ci95(acc["gain_vs_Q_rms"][hi])[0]
+    print(f"\n    EVALUATION POINT. Equation (2)'s constant is a supremum over the region between")
+    print(f"    the exact and approximate endpoints, so the SEGMENT variant is the faithful one and")
+    print(f"    is the only variant that depends on n. Its advantage over TERMINAL should GROW as n")
+    print(f"    shrinks, because that is where the endpoints separate.")
+    print(f"      n={lo}:  segment {seg_lo:.3f} vs terminal {ter_lo:.3f}   (delta {seg_lo-ter_lo:+.3f})")
+    print(f"      n={hi}: segment {seg_hi:.3f} vs terminal {ter_hi:.3f}   (delta {seg_hi-ter_hi:+.3f})")
+    if (seg_lo - ter_lo) > (seg_hi - ter_hi) + 0.03:
+        print("      >>> The predicted pattern holds: the faithful variant gains most where the")
+        print("          region is largest. Report SEGMENT as the primary measurement; this is")
+        print("          evidence the bound describes the mechanism rather than merely bounding it.")
+    else:
+        print("      >>> The predicted pattern does NOT hold. The terminal value is then telling us")
+        print("          about a property of the sample rather than about the constant in Eq. (2),")
+        print("          and must be described that way rather than as a measurement of L_Psi.")
 
     out[tag] = {k: {str(n): dict(zip(("mean", "ci"), ci95(acc[k][n]))) for n in NFES}
                 for _, k in rows}

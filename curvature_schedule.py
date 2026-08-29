@@ -31,7 +31,7 @@
 
 import os, sys, json, time
 os.environ.setdefault("VARIANT", "eval"); os.environ["USE_WANDB"] = "0"; os.environ["ABLATION_IMPORT"] = "1"
-import numpy as np, torch, importlib.util
+import numpy as np, torch, importlib.util, math
 MAIN = os.environ.get("MAIN_SCRIPT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "lfm_clfm_cdfm_experiment.py"))
 spec = importlib.util.spec_from_file_location("expmod", MAIN); M = importlib.util.module_from_spec(spec); sys.modules["expmod"] = M
 print(f"[sched] importing {MAIN} ...")
@@ -51,9 +51,16 @@ load_net = M.load_net; ble_pc_joints = M.ble_pc_joints
 N_EVAL = int(os.environ.get("EVAL_N", "512"))
 NFES   = [int(x) for x in os.environ.get("SC_NFE", "2,4,8,16").split(",")]
 BASES  = os.environ.get("SC_BASES", "latent,direct").split(",")
-CAL_N  = int(os.environ.get("SC_CAL", "64"))       # clips used to calibrate the profile
+CAL_N  = int(os.environ.get("SC_CAL", "64"))
+REPS   = int(os.environ.get("SC_REPS", "5"))   # seeds; >1 turns screening into a replicated result       # clips used to calibrate the profile
 CAL_STEPS = int(os.environ.get("SC_CAL_STEPS", "50"))
 PROFILE_JSON = os.environ.get("SC_PROFILE", os.path.join(os.environ.get("WORK_DIR", "."), "curvature_nfe.json"))
+
+TCRIT = {2:4.303,3:3.182,4:2.776,5:2.571,9:2.262,19:2.093}
+def ci95(a):
+    a = np.asarray(a, float); n = len(a)
+    if n < 2: return float(a.mean()), float("nan")
+    return float(a.mean()), float(TCRIT.get(n - 1, 2.093) * a.std(ddof=1) / math.sqrt(n))
 
 def decode(y, is_lat):
     return rvq.decoder(y * M.z_std_t + M.z_mean_t) if is_lat else y
@@ -154,28 +161,32 @@ for tag in BASES:
         for name, seg in SCHEDULES.items():
             grid = _timesteps(n, name) if seg is None else grid_from_profile(seg, n)
             grid = np.asarray(grid, dtype=np.float32)
-            mf, rmf, bl = [], [], []
-            for s in range(0, N_EVAL, 32):
-                e = min(s + 32, N_EVAL)
-                ts_ = torch.tensor(TSEQ[s:e], device=DEVICE); tm = torch.tensor(TMASK[s:e], device=DEVICE)
-                tp = torch.tensor(TPOOL[s:e], device=DEVICE); L = lens_all[s:e]
-                gm = lengths_to_mask(L, MAXLEN)
-                x = sample_grid(net, is_lat, ts_, tm, tp, L, grid, seed=s)
-                mf.append(memb(x * gm[..., None], L)); bl.append(np.asarray(ble_pc_joints(_gj(x), L)))
-                if real_mf is None:
-                    rm = torch.tensor(np.stack([pad_norm(M.test_entries[int(i)]["motion"])[0] for i in sel[s:e]]), device=DEVICE)
-                    rmf.append(memb(rm * gm[..., None], L))
-            if real_mf is None: real_mf = np.concatenate(rmf, 0)
-            G = np.concatenate(mf, 0)
-            res[(n, name)] = dict(FID=float(fid_calc(G, real_mf)), R3=float(rprec(G, real_mf)[3]),
-                                  BLE=float(np.concatenate(bl).mean()))
-            print(f"  n={n:<4} {name:<24} FID={res[(n,name)]['FID']:.4f}  R@3={res[(n,name)]['R3']:.4f}")
+            fids, r3s = [], []
+            for rep in range(REPS):
+                mf, rmf = [], []
+                for s in range(0, N_EVAL, 32):
+                    e = min(s + 32, N_EVAL)
+                    ts_ = torch.tensor(TSEQ[s:e], device=DEVICE); tm = torch.tensor(TMASK[s:e], device=DEVICE)
+                    tp = torch.tensor(TPOOL[s:e], device=DEVICE); L = lens_all[s:e]
+                    gm = lengths_to_mask(L, MAXLEN)
+                    x = sample_grid(net, is_lat, ts_, tm, tp, L, grid, seed=s + rep * 100000)
+                    mf.append(memb(x * gm[..., None], L))
+                    if real_mf is None:
+                        rm = torch.tensor(np.stack([pad_norm(M.test_entries[int(i)]["motion"])[0] for i in sel[s:e]]), device=DEVICE)
+                        rmf.append(memb(rm * gm[..., None], L))
+                if real_mf is None: real_mf = np.concatenate(rmf, 0)
+                G = np.concatenate(mf, 0)
+                fids.append(float(fid_calc(G, real_mf))); r3s.append(float(rprec(G, real_mf)[3]))
+            fm_, fh_ = ci95(fids)
+            res[(n, name)] = dict(FID=fm_, FID_ci=fh_, R3=float(np.mean(r3s)), reps=REPS, per_seed=fids)
+            print(f"  n={n:<4} {name:<24} FID={fm_:.4f} +/- {fh_:.4f}  R@3={res[(n,name)]['R3']:.4f}")
             wandb.log({f"sched/{tag}/{name}/FID": res[(n, name)]["FID"], "sched/n": n})
 
-    print(f"\n  {'steps':<8}" + "".join(f"{k:>26}" for k in SCHEDULES))
+    print(f"\n  {REPS} seeds per cell; intervals are t-based 95% CIs across seeds.")
+    print(f"  {'steps':<8}" + "".join(f"{k:>26}" for k in SCHEDULES))
     print("  " + "-" * (8 + 26 * len(SCHEDULES)))
     for n in NFES:
-        print(f"  {n:<8}" + "".join(f"{res[(n,k)]['FID']:>26.4f}" for k in SCHEDULES))
+        print(f"  {n:<8}" + "".join(f"{res[(n,k)]['FID']:>18.4f}+/-{res[(n,k)]['FID_ci']:<5.3f}" for k in SCHEDULES))
     print("\n  improvement of arc-matched over linear:")
     for n in NFES:
         d = res[(n, "linear")]["FID"] - res[(n, "arc-matched (decoded)")]["FID"]

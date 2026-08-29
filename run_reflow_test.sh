@@ -1,11 +1,11 @@
 #!/bin/bash -l
-#SBATCH -J curv_schedule
-#SBATCH -o /export/home/kaziz/motion/runs/curv_schedule_%j.out
+#SBATCH -J reflow_test
+#SBATCH -o /export/home/kaziz/motion/runs/reflow_test_%j.out
 #SBATCH -p gpu-all
 #SBATCH --gres gpu:v100_16GB:1
 #SBATCH -c 8
 #SBATCH --mem 32000MB
-#SBATCH --time 20:00:00
+#SBATCH --time 6:00:00
 set -e
 export WORK=/export/home/kaziz/motion
 export CPY=$WORK/miniconda3/envs/ml/bin/python
@@ -17,10 +17,8 @@ export WANDB_PROJECT=motion-clfm
 export WANDB_ENTITY=
 cd $WORK/code
 echo "RVQ_CKPT=$RVQ_CKPT"
-export SC_REPS=${SC_REPS:-5}
-export SC_NFE=${SC_NFE:-2,4,8,16}
-export SC_BASES=${SC_BASES:-latent,direct}
-export SC_CAL=${SC_CAL:-64}
+export RT_REPS=${RT_REPS:-3}
+export RT_NFE=${RT_NFE:-1,2,4,8,16,50}
 export EVAL_N=${EVAL_N:-512}
-$CPY curvature_schedule.py
-echo "=== CURV_SCHEDULE DONE ==="
+$CPY reflow_prediction_test.py
+echo "=== REFLOW TEST DONE ==="
