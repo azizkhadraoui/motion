@@ -184,8 +184,13 @@ def mf_net_class(M):
 
     class MFNet(M.FMNet):
         """FMNet plus an embedding of the interval length h = s - t, zero-initialised so that at
-        warm start u(z, t, s) == v_teacher(z, t) for every s."""
-        H_SCALE = 1000.0
+        warm start u(z, t, s) == v_teacher(z, t) for every s.
+
+        H_SCALE: the interval is embedded as sinusoidal(H_SCALE * (s - t)). It must match the scale at
+        which the teacher embeds t (raw, i.e. 1.0): with 1000, du/dt inherits a ~1000x sensitivity to
+        the interval branch once it learns, the self-referential MF target grows with it, and training
+        diverged (raw MSE 0.7 -> 2e5 in 4k steps, job 404281)."""
+        H_SCALE = float(os.environ.get("MF_HSCALE", "1.0"))
 
         def __init__(s_, cd, Tlen, hid, layers, heads):
             super().__init__(cd, Tlen, hid, layers, heads)
@@ -213,6 +218,6 @@ def load_mf(M, variant):
     p = mf_ckpt_path(M, variant)
     if not os.path.exists(p): return None
     ck = torch.load(p, map_location=M.DEVICE, weights_only=False)
-    net = new_mfnet(M); net.load_state_dict(ck["state"]); net.eval()
+    net = new_mfnet(M); net.H_SCALE = float(ck.get("h_scale", 1000.0)); net.load_state_dict(ck["state"]); net.eval()
     zm = torch.tensor(ck["z_mean"], device=M.DEVICE).float(); zs = torch.tensor(ck["z_std"], device=M.DEVICE).float()
     return net, zm, zs

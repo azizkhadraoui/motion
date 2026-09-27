@@ -156,6 +156,7 @@ opt = torch.optim.AdamW(net.parameters(), lr=LR, weight_decay=0.0)
 ema = M.EMAh(net, M.EMA)
 latest_p = os.path.join(M.CK, f"meanflow_{VTAG}_latest.pt"); best_p = mf_ckpt_path(M, VTAG)
 st, best, log, nonfinite = 0, float("inf"), [], 0
+diverging, DIVERGED = 0, False
 if os.path.exists(latest_p):
     r = torch.load(latest_p, map_location=DEVICE, weights_only=False)
     net.load_state_dict(r["net"]); ema.shadow = {k: v.to(DEVICE) for k, v in r["ema"].items()}
@@ -235,14 +236,22 @@ while st < STEPS:
         print(f"  [{VAR}] {st:>6} loss={np.mean(run_loss):.4f} mse={np.mean(run_raw):.4f} |g|={float(gn):.2f} "
               f"nonfinite={nonfinite} {(time.time()-t0)/60:.1f}m", flush=True)
         log.append(dict(step=st, loss=float(np.mean(run_loss)), mse=float(np.mean(run_raw)), gnorm=float(gn)))
+        # divergence guard: the adaptive weight keeps the weighted loss near 1 even while the raw error
+        # explodes, so watch the RAW mse. 3 consecutive logs above 100x the first logged value -> stop.
+        mse0 = next((r["mse"] for r in log if "mse" in r), None)
+        diverging = diverging + 1 if (mse0 and np.mean(run_raw) > 100 * mse0) else 0
         run_loss, run_raw = [], []
+        if diverging >= 3:
+            DIVERGED = True
+            print(f"  [{VAR}] raw MSE > 100x its initial value for 3 consecutive logs: training DIVERGED, stopping.", flush=True)
+            break
     if st % 2000 == 0: save_latest()
     if st % EVAL_EVERY == 0 or st == STEPS:
         f1 = eval_ema(1); f2 = eval_ema(2); star = ""
         if f1 < best:
             best = f1; star = "  <-BEST"
             M.safe_save(dict(state={k: v.clone() for k, v in ema.shadow.items()}, step=st, metric=f1, variant=VAR,
-                             omega=OMEGA, jvp=JVP_MODE, z_mean=zm, z_std=zsd), best_p)
+                             omega=OMEGA, jvp=JVP_MODE, h_scale=net.H_SCALE, z_mean=zm, z_std=zsd), best_p)
         log.append(dict(step=st, fid1=f1, fid2=f2))
         print(f"    [{VAR} eval {st}] 1-NFE FID={f1:.4f}  2-NFE FID={f2:.4f}{star}", flush=True)
         save_latest()
@@ -274,6 +283,6 @@ if VAR == "mf" and not stable:
     print("  MF's self-referential target is what iMF exists to fix; an unstable MF here is an independent")
     print("  confirmation of that motivation and worth one sentence in the paper.")
 json.dump(dict(variant=VAR, steps=st, lr=LR, bs=BS, omega=OMEGA, ratio=RATIO, jvp_mode=JVP_MODE, jvp_rel_err=rel,
-               nonfinite=nonfinite, best_quick_fid1=best, log=log, final={str(k): v for k, v in final.items()}),
+               nonfinite=nonfinite, diverged=DIVERGED, h_scale=net.H_SCALE, best_quick_fid1=best, log=log, final={str(k): v for k, v in final.items()}),
           open(os.path.join(WORK_DIR, f"meanflow_{VTAG}_train.json"), "w"), indent=2, default=float)
 print(f"-> {os.path.join(WORK_DIR, f'meanflow_{VTAG}_train.json')}\nMeanFlow [{VAR}] done. Next: onestep_placement.py picks up {best_p}")
