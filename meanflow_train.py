@@ -132,7 +132,10 @@ z0 = torch.randn_like(z1[sub]); t, s = sample_ts(8); s = torch.maximum(s, t + 0.
 zt = (1 - t)[:, None, None] * z0 + t[:, None, None] * z1[sub]; tz = z1[sub] - z0
 JVP_MODE = "func"
 try:
-    net.eval()
+    # train mode on purpose: eval() routes nn.MultiheadAttention to the fused fast path
+    # (_native_multi_head_attention), which has no forward-mode AD. Dropout is zeroed, so train mode
+    # is deterministic, and it is the mode training itself uses.
+    net.train()
     d_func = jvp_func(zt, t, s, cs, tz)
     d_fd = jvp_fd(zt, t, s, cs, tz)
     rel = float((d_func - d_fd).norm() / d_fd.norm().clamp_min(1e-12))

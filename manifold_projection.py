@@ -223,6 +223,21 @@ else:
     print("  correction is then intrinsic to the constraint rather than to this particular operator,")
     print("  which is a sharper claim than we can currently make and worth stating explicitly.")
 
+kin = [r for r in rows if r["op"].startswith("kin-metric")]
+if kin:
+    bestk = min(kin, key=lambda r: r["FID"])
+    print(f"\n  ProjFlow's remedy (4.2): best kinematics-aware projection '{bestk['op']}' FID {bestk['FID']:.4f}, "
+          f"displacement {bestk['DISP']:.5f} m, incoherence {bestk['INCO']:.5f} "
+          f"(Euclidean: FID {near['FID']:.4f}, incoherence {near['INCO']:.5f}).")
+    gap = ret["FID"] - non["FID"]      # threshold fixed before the run: recovers = closes >= half the gap
+    if gap > 0 and bestk["FID"] <= ret["FID"] - 0.5 * gap:
+        print("  -> FID RECOVERS under the kinematic metric: the GEOMETRY of the correction matters, not its magnitude.")
+    else:
+        print("  -> FID does NOT recover under the kinematic metric: the cost of exact bone correction is intrinsic,")
+        print("     and we have tested the CVPR paper's own remedy.")
+    if max(r["BLE"] for r in kin) > 1e-4:
+        print("  WARNING: a kinematic-metric row is not exactly valid (BLE > 1e-4); raise MF_STEPS.")
+
 print("\n  Scope note for the writeup: C_bone is exactly R^3 x (S^2)^21 per frame by construction.")
 print("  We make no claim about the curvature of the space of plausible motions, which is a subset")
 print("  of this with no closed form and is not characterized here.")
