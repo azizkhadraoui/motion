@@ -59,6 +59,7 @@ BASE = os.environ.get("MF_BASE", "latent"); IS_LAT = (BASE in ("latent", "latent
 N_EVAL = int(os.environ.get("EVAL_N", "512"))
 PROJ_STEPS = int(os.environ.get("MF_STEPS", "300"))
 PROJ_LR = float(os.environ.get("MF_LR", "0.05"))
+KIN_W = [float(x) for x in os.environ.get("MF_KIN", "10,100").split(",") if x]   # ProjFlow metric weights
 
 # ---- kinematic order: each edge's child depends on its parent, chains are already topological ----
 PARENT = [e[0] for e in EDGES]; CHILD = [e[1] for e in EDGES]
@@ -87,26 +88,48 @@ def params_from_joints(Q):
     V = V / V.norm(dim=-1, keepdim=True).clamp_min(1e-8)
     return root, V
 
-def nearest_projection(Q, L, steps=PROJ_STEPS, lr=PROJ_LR):
-    """Euclidean nearest point on C_bone, by optimizing over R^3 x (S^2)^E. Warm-started from the
-    retraction, so the returned point is never worse than it in displacement."""
+def nearest_projection(Q, L, steps=PROJ_STEPS, lr=PROJ_LR, kin_w=0.0):
+    """Nearest point on C_bone with the ROOT FROZEN, by optimizing the bone directions on (S^2)^E.
+    Warm-started from the retraction (which also leaves the root in place).
+
+    ROOT FREEZE: the root joint is not a free variable. _joints_to_norm writes only the root-relative
+    RIC dims and keeps the root trajectory of the original sample, so any root displacement found by
+    the solver would be silently discarded on write-back -- the returned joints would then disagree
+    with what is evaluated, and a nonzero BLE / an artificial FSR change could result. Holding it
+    fixed makes the solved point exactly the point that is evaluated.
+
+    METRIC: kin_w = 0 is the Euclidean metric. kin_w > 0 solves under ProjFlow's kinematics-aware
+    metric  R = kin_w (I_3 (x) I_N (x) L_kin) + I,  i.e. the objective
+        sum_j |d_j|^2 + kin_w * sum_{(p,c) in edges} |d_p - d_c|^2 ,   d = Q_proj - Q_target,
+    which prefers corrections that are coherent along the kinematic tree (whole sub-chains moving
+    together) over corrections that are merely small."""
     with torch.no_grad():
-        Q0 = project_bonelength(Q)                 # retraction: feasible starting point
+        Q0 = project_bonelength(Q)                 # retraction: feasible starting point, root unchanged
         root0, U0 = params_from_joints(Q0)
-    root = root0.clone().requires_grad_(True)
+    root = root0.detach()                          # frozen
     V = U0.clone().requires_grad_(True)            # unconstrained; normalized inside the objective
-    opt = torch.optim.Adam([root, V], lr=lr)
+    opt = torch.optim.Adam([V], lr=lr)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(steps, 1), eta_min=lr * 0.02)
     fm = lengths_to_mask(L, MAXLEN).float().unsqueeze(-1).unsqueeze(-1)
     Qt = Q.detach()
     for _ in range(steps):
         U = V / V.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-        Qp = forward_kin(root, U)
-        loss = (((Qp - Qt) ** 2).sum(-1, keepdim=True) * fm).sum() / fm.sum().clamp_min(1)
+        D = forward_kin(root, U) - Qt
+        loss = ((D ** 2).sum(-1, keepdim=True) * fm).sum()
+        if kin_w > 0:
+            De = D[:, :, PARENT, :] - D[:, :, CHILD, :]
+            loss = loss + kin_w * ((De ** 2).sum(-1, keepdim=True) * fm).sum()
+        loss = loss / fm.sum().clamp_min(1)
         opt.zero_grad(); loss.backward(); opt.step(); sch.step()
     with torch.no_grad():
         U = V / V.norm(dim=-1, keepdim=True).clamp_min(1e-8)
         return forward_kin(root, U).detach()
+
+def incoherence(Qa, Qb, L):
+    """Mean |d_parent - d_child| over bones: how much the correction tears the kinematic tree."""
+    fm = lengths_to_mask(L, MAXLEN).float().unsqueeze(-1)
+    D = Qa - Qb; De = (D[:, :, PARENT, :] - D[:, :, CHILD, :]).norm(dim=-1)
+    return float((De * fm).sum() / (fm.sum() * De.shape[2] + 1e-8))
 
 def displacement(Qa, Qb, L):
     fm = lengths_to_mask(L, MAXLEN).float().unsqueeze(-1)
@@ -124,9 +147,9 @@ caps = [M.test_entries[int(i)]["texts"][0] for i in sel]
 lens_all = torch.tensor([int(M.test_lens[i]) for i in sel], device=DEVICE)
 TSEQ, TMASK, TPOOL = embed_text(caps)
 
-OPS = ["none", "retraction (current)", "nearest projection",
-       "foot + retraction", "foot + nearest projection"]
-acc = {k: dict(ble=[], fsr=[], disp=[], mf=[]) for k in OPS}
+OPS = (["none", "retraction (current)", "nearest projection"] + [f"kin-metric projection w={w:g}" for w in KIN_W]
+       + ["foot + retraction", "foot + nearest projection"] + [f"foot + kin-metric w={w:g}" for w in KIN_W])
+acc = {k: dict(ble=[], fsr=[], disp=[], inco=[], mf=[]) for k in OPS}
 real_mf = []
 print(f"\n{'='*104}\nMANIFOLD PROJECTION — base={BASE}, {N_EVAL} clips, {PROJ_STEPS} solver steps\n{'='*104}")
 t0 = time.time()
@@ -146,12 +169,15 @@ for s in range(0, N_EVAL, 32):
         "foot + retraction": project_bonelength(Jf),
         "foot + nearest projection": nearest_projection(Jf, L),
     }
+    for w in KIN_W:
+        variants[f"kin-metric projection w={w:g}"] = nearest_projection(J0, L, kin_w=w)
+        variants[f"foot + kin-metric w={w:g}"] = nearest_projection(Jf, L, kin_w=w)
     with torch.no_grad():
         for k, J in variants.items():
             xn = x if k == "none" else _joints_to_norm(J, x)
             Jm = _gj(xn)
             acc[k]["ble"].append(ble_pc_joints(Jm, L)); acc[k]["fsr"].append(fsr_pc(Jm, L))
-            acc[k]["disp"].append(displacement(Jm, J0, L))
+            acc[k]["disp"].append(displacement(Jm, J0, L)); acc[k]["inco"].append(incoherence(Jm, J0, L))
             acc[k]["mf"].append(memb(xn * gm[..., None], L))
         rm = torch.tensor(np.stack([pad_norm(M.test_entries[int(i)]["motion"])[0] for i in sel[s:e]]), device=DEVICE)
         real_mf.append(memb(rm * gm[..., None], L))
@@ -164,13 +190,13 @@ for k in OPS:
     rows.append(dict(op=k, FID=float(fid_calc(G, R)), R3=float(rprec(G, R)[3]),
                      BLE=float(np.concatenate(acc[k]["ble"]).mean()),
                      FSR=float(np.concatenate(acc[k]["fsr"]).mean()),
-                     DISP=float(np.mean(acc[k]["disp"]))))
+                     DISP=float(np.mean(acc[k]["disp"])), INCO=float(np.mean(acc[k]["inco"]))))
 
 print(f"\n{'='*104}")
-print(f" {'operator':<30}{'FID':>10}{'R@3':>9}{'BLE':>12}{'FSR':>10}{'displacement (m)':>19}")
+print(f" {'operator':<30}{'FID':>10}{'R@3':>9}{'BLE':>12}{'FSR':>10}{'displacement (m)':>19}{'incoherence':>13}")
 print("-" * 104)
 for r in rows:
-    print(f" {r['op']:<30}{r['FID']:>10.4f}{r['R3']:>9.4f}{r['BLE']:>12.5f}{r['FSR']:>10.5f}{r['DISP']:>19.5f}")
+    print(f" {r['op']:<30}{r['FID']:>10.4f}{r['R3']:>9.4f}{r['BLE']:>12.5f}{r['FSR']:>10.5f}{r['DISP']:>19.5f}{r['INCO']:>13.5f}")
 print("=" * 104)
 
 get = lambda n: [r for r in rows if r["op"] == n][0]
@@ -201,8 +227,8 @@ print("\n  Scope note for the writeup: C_bone is exactly R^3 x (S^2)^21 per fram
 print("  We make no claim about the curvature of the space of plausible motions, which is a subset")
 print("  of this with no closed form and is not characterized here.")
 
-dst = os.path.join(os.environ.get("WORK_DIR", "."), f"manifold_projection_{BASE}.json")
-json.dump(dict(base=BASE, n=N_EVAL, steps=PROJ_STEPS, rows=rows), open(dst, "w"), indent=2)
+dst = os.path.join(os.environ.get("WORK_DIR", "."), f"manifold_projection_{BASE}_rootfrozen.json")
+json.dump(dict(base=BASE, n=N_EVAL, steps=PROJ_STEPS, root="frozen", kin_w=KIN_W, rows=rows), open(dst, "w"), indent=2)
 print(f"\nraw results -> {dst}")
 wandb.log({"manifold_table": wandb.Table(columns=["operator", "FID", "R@3", "BLE", "FSR", "displacement"],
                                          data=[[r["op"], r["FID"], r["R3"], r["BLE"], r["FSR"], r["DISP"]] for r in rows])})
