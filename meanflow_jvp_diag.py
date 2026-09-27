@@ -11,6 +11,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from iclr_common import load_main, new_mfnet
 
 M = load_main("jvp-diag"); DEVICE = M.DEVICE
+
+
+def _sinusoidal(t, dim, mp=10000):
+    """M.sinusoidal with the input dtype preserved (the original casts to float32, which breaks the
+    float64 copy of the network). Numerically identical in float32."""
+    import math
+    half = dim // 2; fr = torch.exp(-math.log(mp) * torch.arange(half, device=t.device, dtype=t.dtype) / half)
+    a = t.unsqueeze(-1) * fr
+    return torch.cat([torch.cos(a), torch.sin(a)], -1)
+M.sinusoidal = _sinusoidal
 torch.backends.cuda.matmul.allow_tf32 = False; torch.backends.cudnn.allow_tf32 = False
 ck = torch.load(os.path.join(M.CK, "latent_best.pt"), map_location=DEVICE, weights_only=False)
 net = new_mfnet(M); net.load_state_dict(ck["state"], strict=False)
