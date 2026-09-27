@@ -146,6 +146,8 @@ except Exception as e:
     print(f"[meanflow] torch.func.jvp failed through this network ({type(e).__name__}: {str(e)[:200]})", flush=True)
     rel = float("nan"); JVP_MODE = "fd"
 net.train()
+if os.environ.get("MF_JVP") in ("func", "fd"):              # explicit override (see meanflow_jvp_diag.py)
+    JVP_MODE = os.environ["MF_JVP"]; print(f"[meanflow] JVP mode forced by MF_JVP={JVP_MODE}")
 print(f"[meanflow] JVP mode: {JVP_MODE}" + ("  (FALLBACK: finite difference)" if JVP_MODE == "fd" else ""), flush=True)
 jvp = jvp_func if JVP_MODE == "func" else jvp_fd
 
