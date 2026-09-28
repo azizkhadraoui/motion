@@ -141,7 +141,11 @@ try:
     rel = float((d_func - d_fd).norm() / d_fd.norm().clamp_min(1e-12))
     print(f"[meanflow] JVP check: torch.func vs central difference, rel. err = {rel:.2e}  "
           f"(|du/dt| = {d_fd.norm().item():.3f})", flush=True)
-    if not (rel < 5e-2): JVP_MODE = "fd"
+    # func-jvp is exact; a central difference at eps 1e-3 is NOT a valid reference here: the network is
+    # sharply curved in t (meanflow_jvp_diag.py: fd@1e-3 is 14% off along t, while float64 fd converges
+    # to func-jvp as eps -> 1e-5). So the disagreement is only reported; fd is used only if func raises.
+    if not (rel < 5e-2):
+        print("[meanflow] note: fd@1e-3 differs from func-jvp; expected (curvature in t), func-jvp kept.")
 except Exception as e:
     print(f"[meanflow] torch.func.jvp failed through this network ({type(e).__name__}: {str(e)[:200]})", flush=True)
     rel = float("nan"); JVP_MODE = "fd"
