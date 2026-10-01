@@ -46,10 +46,12 @@ def fmt(m, h, p=4):
 # ------------------------------------------------------------------ clip set
 class ClipSet:
     """The fixed evaluation clips plus everything that does not depend on the sampler."""
-    def __init__(self, M, n, bs=32):
+    def __init__(self, M, n, bs=32, start=0):
+        """start > 0 takes clips [start, start+n) of the same permutation: start = 512 gives a SCREENING
+        set disjoint from the standard 512-clip report set, for hyperparameter selection."""
         self.M = M; self.n = n; self.bs = bs; D = M.DEVICE
         rng = np.random.default_rng(0)
-        self.sel = np.array(sorted(rng.permutation(len(M.test_entries))[:n].tolist()))
+        self.sel = np.array(sorted(rng.permutation(len(M.test_entries))[start:start + n].tolist()))
         caps = [M.test_entries[int(i)]["texts"][0] for i in self.sel]
         self.lens = torch.tensor([int(M.test_lens[i]) for i in self.sel], device=D)
         self.tseq, self.tmask, self.tpool = M.embed_text(caps)
